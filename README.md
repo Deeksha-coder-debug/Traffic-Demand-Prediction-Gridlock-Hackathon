@@ -2,10 +2,10 @@
 
 ## 1st version of the solution 
 
-==============================================================================
+
 GRIDLOCK HACKATHON — TRAFFIC DEMAND PREDICTION
 METHODOLOGY & APPROACH DOCUMENTATION
-==============================================================================
+
 
 PROBLEM STATEMENT
 -----------------
