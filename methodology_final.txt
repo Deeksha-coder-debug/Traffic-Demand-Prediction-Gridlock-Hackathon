@@ -1,0 +1,238 @@
+==============================================================================
+GRIDLOCK HACKATHON — TRAFFIC DEMAND PREDICTION
+METHODOLOGY & APPROACH DOCUMENTATION
+==============================================================================
+
+PROBLEM STATEMENT
+-----------------
+Predict traffic demand (a continuous value) at geographic locations and
+timestamps using: geohash, road type, number of lanes, large vehicles,
+landmarks, weather, temperature, day, and timestamp.
+
+Evaluation Metric: score = max(0, 100 * R²(actual, predicted))
+
+==============================================================================
+LEAKAGE-FREE DESIGN
+==============================================================================
+
+This solution uses only features derivable from raw inputs (time, location,
+weather, road characteristics). No lag or rolling window features are used,
+ensuring CV scores reflect genuine generalisation to unseen test data.
+
+==============================================================================
+PIPELINE OVERVIEW
+==============================================================================
+
+STEP 1 — DATA LOADING
+----------------------
+  Train : (77299, 11)
+  Test  : (41778, 10)
+
+STEP 2 — DATA CLEANING
+-----------------------
+  - NumberofLanes, Temperature, day: cast via pd.to_numeric, errors='coerce'
+  - LargeVehicles: mapped ('Allowed' → 1, 'Not Allowed' → 0), NaN → 0
+  - Landmarks: mapped ('Yes' → 1, 'No' → 0), NaN → 0
+  - NumberofLanes: NaN filled with 1
+  - Temperature: NaN filled with column median
+  - RoadType, Weather: NaN filled with 'Unknown'
+  - Timestamp parsed as HH:MM strings → (hour, minute) integers;
+    unparseable values default to hour=12, minute=0
+  - dayofweek derived as (day - 1) % 7
+
+STEP 3 — GEOHASH PROCESSING
+-----------------------------
+  - Hierarchical geohash prefixes extracted:
+      gh_4 (first 4 chars), gh_5 (first 5), gh_6 (first 6)
+  - All three encoded via LabelEncoder fitted on training data only;
+    unseen test values mapped to -1
+
+STEP 4 — FEATURE ENGINEERING (32 features total)
+--------------------------------------------------
+  1. CYCLICAL TIME ENCODING
+     Preserves the circular nature of time — hour 23 is close to hour 0:
+       hour_sin, hour_cos  →  sin/cos of hour over 24-hour cycle
+       dow_sin,  dow_cos   →  sin/cos of dayofweek over 7-day cycle
+
+  2. BINARY TIME FLAGS
+       is_weekend    : dayofweek ≥ 5
+       is_rush_hour  : hour 7–9 or 17–19
+       is_night      : hour ≥ 22 or ≤ 5
+
+  3. GAUSSIAN RUSH PROBABILITY
+       rush_prob = exp(-((hour-8)/2)²) + exp(-((hour-18)/2)²)
+     Smooth continuous proxy for rush hour intensity — peaks at 8 AM and
+     6 PM, tapering naturally. More informative than a binary flag.
+
+  4. WEATHER FEATURES
+       weather_severity: ordinal map
+         Sunny=0, Clear=0.1, Clouds=0.2, Foggy=0.4,
+         Rainy=0.7, Snowy=0.9, Storm=1.0, Unknown=0.3
+       bad_weather: weather_severity > 0.5 (binary)
+
+  5. TEMPERATURE FEATURES
+       temp_normalized : (Temperature - 20) / 15
+       temp_optimal    : exp(-((Temperature - 22) / 10)²)
+         Gaussian centred at 22°C — captures the idea that extreme
+         temperatures (hot or cold) reduce travel demand.
+
+  6. ROAD TYPE FEATURES
+       road_type    : ordinal (Residential=0, Arterial=1, Highway=2)
+       road_capacity: domain-mapped throughput estimate
+         (Residential=500, Arterial=1200, Highway=2000)
+       lanes_normalized : NumberofLanes / 5
+       total_capacity   : NumberofLanes × road_capacity
+
+  7. INTERACTION FEATURES
+     Cross-product terms capture combined effects:
+       weather_rush      : weather_severity × rush_prob
+       weekend_rush      : is_weekend × rush_prob
+       landmark_rush     : Landmarks × rush_prob
+       large_vehicle_rush: LargeVehicles × rush_prob
+       road_rush         : road_type × rush_prob
+       hour_squared      : (hour / 12)²
+
+  8. GEOHASH ENCODED FEATURES
+       gh_4_enc, gh_5_enc, gh_6_enc (LabelEncoder)
+
+  Feature selection: all numeric columns except Index, demand, timestamp,
+  raw geohash strings, minute, day, dayofweek (32 retained features).
+  All NaNs replaced with 0 before training.
+
+STEP 5 — SCALING
+-----------------
+  StandardScaler fitted on training data only; applied to both train and test.
+  Required by gradient boosted models for numerical stability.
+
+STEP 6 — TRAIN / VALIDATION SPLIT
+-----------------------------------
+  Temporal 80/20 split (preserves time ordering):
+    Train      : 61,839 samples (first 80%)
+    Validation : 15,460 samples (last 20%)
+
+==============================================================================
+MODELS — DETAILS & RATIONALE
+==============================================================================
+
+Five base models used in both Version 1 and Version 2 configurations:
+
+┌───────────────┬──────────────────────────────────────────────────────────┐
+│ Model         │ Rationale                                                │
+├───────────────┼──────────────────────────────────────────────────────────┤
+│ Extra Trees   │ Extremely Randomised Trees use fully random split        │
+│ (ET)          │ thresholds. Lower variance via double randomisation      │
+│               │ (random features + random thresholds). Computationally   │
+│               │ fast and provides decorrelated predictions vs RF.        │
+├───────────────┼──────────────────────────────────────────────────────────┤
+│ Random Forest │ Bagging ensemble of CART trees. Each tree trained on a  │
+│ (RF)          │ bootstrap sample with random feature subsets. Robust to │
+│               │ overfitting; best individual R² (0.774) in this run.    │
+├───────────────┼──────────────────────────────────────────────────────────┤
+│ LightGBM      │ Gradient boosting with leaf-wise tree growth and        │
+│ (LGBM)        │ histogram binning. Highly efficient on large tabular     │
+│               │ datasets. Row/column subsampling + L1/L2 regularisation │
+│               │ prevent overfitting.                                     │
+├───────────────┼──────────────────────────────────────────────────────────┤
+│ XGBoost       │ Gradient boosting with built-in L1 (reg_alpha) + L2    │
+│ (XGB)         │ (reg_lambda) regularisation, row/column subsampling.    │
+│               │ Adds a different boosting perspective to the ensemble.   │
+├───────────────┼──────────────────────────────────────────────────────────┤
+│ CatBoost      │ Gradient boosting with symmetric trees and ordered       │
+│               │ target statistics for categorical features. Avoids       │
+│               │ target leakage during encoding; strong regularisation.   │
+└───────────────┴──────────────────────────────────────────────────────────┘
+
+==============================================================================
+ENSEMBLE STRATEGY — TWO VERSIONS + BLENDING
+==============================================================================
+
+VERSION 1 (800 estimators / moderate depth)
+--------------------------------------------
+  Model       Hyperparameters                             Val R²
+  ET          n_estimators=800, max_depth=15              0.74784
+  RF          n_estimators=800, max_depth=15              0.77388
+  LGBM        n_estimators=1000, num_leaves=40, lr=0.025  0.72295
+  XGB         n_estimators=1000, max_depth=9,  lr=0.025  0.72549
+  CatBoost    iterations=1000,   depth=8,      lr=0.025  0.73112
+
+  Optimised weights (scipy L-BFGS-B, convex combination):
+    RF: 1.000  (optimizer concentrated all weight on the best model)
+  Ensemble R²: 0.773876  |  Score: 77.39
+
+VERSION 2 (1000–1500 estimators / greater depth)
+--------------------------------------------------
+  Model       Hyperparameters                             Val R²
+  ET          n_estimators=1000, max_depth=16             0.74911
+  RF          n_estimators=1000, max_depth=16             0.77471
+  LGBM        n_estimators=1500, num_leaves=45, lr=0.02   0.71271
+  XGB         n_estimators=1500, max_depth=10, lr=0.02   0.72416
+  CatBoost    iterations=1500,   depth=9,      lr=0.02   0.71906
+
+  Optimised weights:
+    RF: 1.000
+  Ensemble R²: 0.774714  |  Score: 77.47
+
+CROSS-VERSION BLENDING
+-----------------------
+  Grid search over blend weights [0.1, 0.2, … 0.9] on validation set:
+    Best weight for Version 1: 0.1
+    Final predictions = 0.1 × preds_v1 + 0.9 × preds_v2
+  Blended validation R²: 0.774678  |  Blended Score: 77.47
+
+  Final predictions clipped to [0, 1].
+
+==============================================================================
+WEIGHT OPTIMISATION METHOD
+==============================================================================
+
+scipy.optimize.minimize with method='L-BFGS-B' (Limited-memory BFGS with
+box constraints). Minimises negative R² subject to weights ≥ 0. Weights
+normalised to sum to 1 after optimisation. Consistently selected RF as the
+dominant model because RF's individual R² (0.774) exceeded all boosting
+models on this validation split.
+
+==============================================================================
+VALIDATION RESULTS SUMMARY
+==============================================================================
+
+  ┌────────────────────────────────┬──────────┬──────────────┐
+  │ Configuration                  │ Val R²   │ Score (/100) │
+  ├────────────────────────────────┼──────────┼──────────────┤
+  │ Version 1 (800 estimators)     │ 0.773876 │ 77.39        │
+  │ Version 2 (1000–1500 est.)     │ 0.774714 │ 77.47        │
+  │ Blended (0.1×V1 + 0.9×V2)  🏆 │ 0.774678 │ 77.47        │
+  └────────────────────────────────┴──────────┴──────────────┘
+
+  🏆 EXPECTED HACKATHON SCORE: 77.47 / 100
+
+==============================================================================
+SUBMISSION FILE
+==============================================================================
+
+  File  : submission_final_optimized 2.csv
+  Shape : (41778, 2)  — columns: Index, demand
+  Range : min=0.0043, max=1.0000, mean=0.1255
+  Nulls : 0  |  Negatives: 0  |  Values above 1: 0
+
+==============================================================================
+TOOLS & LIBRARIES USED
+==============================================================================
+
+Language     : Python 3 (Google Colab)
+ML Libraries : lightgbm, xgboost, catboost, scikit-learn
+               (RandomForestRegressor, ExtraTreesRegressor,
+                LabelEncoder, StandardScaler, r2_score)
+Optimisation : scipy.optimize.minimize (L-BFGS-B) for weight optimisation
+Geo Encoding : geohash2
+Data         : pandas, numpy
+Utilities    : warnings, os, zipfile
+
+==============================================================================
+FILE DESCRIPTIONS
+==============================================================================
+
+gridlock_hackathon_final.ipynb          — Full solution notebook (Colab)
+submission_final_optimized 2.csv        — Final predictions (41778 × 2)
+methodology.txt                         — This file
+
+==============================================================================
