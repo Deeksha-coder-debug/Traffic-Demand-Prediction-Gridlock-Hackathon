@@ -392,9 +392,9 @@ methodology.txt                            — This file
 ==============================================================================
 
 
-##3rd version of the solution
+## 3rd version of the solution
 
-##Final version of the solution
+## Final version of the solution
 
 ==============================================================================
 GRIDLOCK HACKATHON — TRAFFIC DEMAND PREDICTION
